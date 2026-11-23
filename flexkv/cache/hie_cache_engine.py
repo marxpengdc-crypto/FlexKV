@@ -1,0 +1,656 @@
+from typing import Optional, Tuple, TYPE_CHECKING, List, Dict
+
+import time
+import numpy as np
+import torch
+
+from flexkv.c_ext import CRadixNode
+from flexkv import c_ext
+from flexkv.cache.mempool import Mempool
+from flexkv.cache.radix_remote import LocalRadixTree, DistributedRadixTree
+from flexkv.cache.redis_meta import RedisMetaChannel as _PyRedisMetaChannel
+from flexkv.cache.redis_meta import RedisMeta
+from flexkv.common.block import SequenceMeta
+from flexkv.common.debug import eviction_log_aggregator
+#if TYPE_CHECKING:
+from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV
+from flexkv.common.transfer import DeviceType
+from flexkv.common.type import MatchResultAccel
+
+
+class HierarchyLRCacheEngine:
+    def __init__(self,
+                 num_total_blocks: int,
+                 tokens_per_block: int,
+                 evict_ratio: float,
+                device_type: DeviceType,
+                # Optional runtime wiring for remote/local trees
+                local_max_num_blocks: Optional[int] = 0,
+                local_lease_ttl_ms: int = 100000,
+                 local_renew_lease_ms: int = 10000,
+                 local_refresh_batch_size: int = 1000,
+                 local_idle_sleep_ms: int = 10,
+                 remote_max_num_blocks: int = 4000000,
+                 redis_node_id: int = 0,
+                 remote_refresh_batch_size: int = 1000,
+                 remote_rebuild_interval_ms: int = 100,
+                 remote_idle_sleep_ms: int = 10,
+                 local_safety_ttl_ms: int = 100,
+                 evict_start_threshold: float = 1.0,
+                 hit_reward_seconds: int = 0,
+                 eviction_policy: str = "lru",
+                 meta: Optional[RedisMeta] = None,
+                 reset_barrier_timeout_ms: int = 60000,
+                 reset_barrier_poll_ms: int = 50) -> None:
+        if num_total_blocks <= 0:
+            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
+        if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
+            raise ValueError(
+                f"Invalid tokens_per_block: {tokens_per_block}, tokens_per_block must be a power of 2"
+            )
+
+        self.device_type = device_type
+        self._meta: Optional[RedisMeta] = meta # todo: define storage type in meta
+
+
+        # belows are only for 3rd-party remote storage (like pcfs)
+        # Mapping: node_id -> list of PCFS file_nodeids
+        self.nid_to_file_nodeids: Dict[int, List[int]] = {}
+        # Partition parameter used for mapping block_id to file index
+        self.round_robin: int = 1
+
+        # Local index (authoritative for mutations)
+        self.local_index = LocalRadixTree(
+            tokens_per_block=tokens_per_block,
+            max_num_blocks=int(num_total_blocks),
+            lease_ttl_ms=int(local_lease_ttl_ms),
+            renew_lease_ms=int(local_renew_lease_ms),
+            refresh_batch_size=int(local_refresh_batch_size),
+            idle_sleep_ms=int(local_idle_sleep_ms),
+            safety_ttl_ms=int(local_safety_ttl_ms),
+            swap_block_threshold=int(evict_ratio * num_total_blocks),
+            hit_reward_seconds=int(hit_reward_seconds),
+            eviction_policy=eviction_policy,
+        )
+
+
+        # Remote reference index (read-only, built from Redis)
+        self.remote_index = DistributedRadixTree(
+            tokens_per_block=tokens_per_block,
+            max_num_blocks=int(remote_max_num_blocks or (num_total_blocks * 10)),
+            node_id=int(redis_node_id),
+            refresh_batch_size=int(remote_refresh_batch_size),
+            rebuild_interval_ms=int(remote_rebuild_interval_ms),
+            idle_sleep_ms=int(remote_idle_sleep_ms),
+            lease_renew_ms=int(local_renew_lease_ms),
+            hit_reward_seconds=int(hit_reward_seconds),
+        )
+        # defer channel start to start(meta)
+
+        # Local memory pool for physical blocks on this device
+        self.mempool = Mempool(num_total_blocks=int(local_max_num_blocks or num_total_blocks))
+
+        self.tokens_per_block = tokens_per_block
+        self.num_total_blocks = num_total_blocks
+        self.evict_ratio = evict_ratio
+        self.evict_start_threshold = evict_start_threshold
+        self.reset_barrier_timeout_ms = int(reset_barrier_timeout_ms)
+        self.reset_barrier_poll_ms = int(reset_barrier_poll_ms)
+        if self.reset_barrier_timeout_ms <= 0:
+            raise ValueError("reset_barrier_timeout_ms must be positive")
+        if self.reset_barrier_poll_ms <= 0:
+            raise ValueError("reset_barrier_poll_ms must be positive")
+
+        # cumulative statistics: for analyzing distributed KV reuse benefits
+        self._stats_total_queried_tokens = 0       # total tokens queried
+        self._stats_gpu_matched_tokens = 0         # total tokens matched in GPU memory
+        self._stats_local_matched_tokens = 0       # total tokens matched in FlexKV local
+        self._stats_distributed_matched_tokens = 0 # total tokens matched in FlexKV global (distributed reuse)
+        self._stats_match_count = 0                # match_all call count
+
+        # Hierarchical/distributed radix indexes do not expose the node-mounted
+        # SWA match and lifecycle contract yet. Keep the capability disabled
+        # instead of creating a pool that makes callers believe SWA is usable.
+        self.swa_pool = None
+
+    def init_swa(self, swa_config: "SWAPoolConfig") -> None:
+        raise NotImplementedError(
+            "HierarchyLRCacheEngine does not support node-mounted SWA")
+
+    @property
+    def swa_enabled(self) -> bool:
+        return False
+
+    def _alloc_swa_slot(self, protected_node=None) -> int:
+        return -1
+
+    def _free_unmounted_swa_slot(self, slot: int) -> None:
+        if self.swa_pool is None or slot is None or slot < 0:
+            return
+        self.swa_pool.free(int(slot))
+
+    @staticmethod
+    def _get_mounted_swa_slot(node: Optional["CRadixNode"]) -> int:
+        return -1
+
+    def _drain_unmounted_swa_slots(self) -> None:
+        return
+
+    def start(self) -> None:
+        if self._meta is None:
+            raise ValueError("RedisMeta is not provided; ensure from_cache_config stores it or pass it to start().")
+        #TODO can we use like this to distinguish the different tree pairs?
+        # Determine base block key prefix by device type
+        if self.device_type == DeviceType.REMOTE:
+            base_key = "PCFSB"
+        elif self.device_type == DeviceType.CPU:
+            base_key = "CPUB"
+        elif self.device_type == DeviceType.SSD:
+            base_key = "SSDB"
+        else:
+            raise ValueError(f"Invalid device type: {self.device_type}")
+
+        local_ch_block_key = base_key
+        remote_ch_block_key = base_key
+        self.remote_ch = self._meta.get_redis_meta_channel(remote_ch_block_key)
+        self.local_ch = self._meta.get_redis_meta_channel(local_ch_block_key)
+                # Load and store mapping of node_id -> file_nodeids from Redis
+        if self.device_type == DeviceType.REMOTE:
+            try:
+                self.nid_to_file_nodeids = self._meta.load_pcfs_file_nodeids()
+            except Exception:
+                raise ValueError("Failed to load PCFS file nodeids from Redis")
+        if not self.local_index.start(self.local_ch):
+            raise RuntimeError(
+                f"Failed to start local radix tree for device type: {self.device_type}"
+            )
+        if not self.remote_index.start(self.remote_ch):
+            self.local_index.stop()
+            raise RuntimeError(
+                f"Failed to start distributed radix tree for device type: {self.device_type}"
+            )
+
+    def stop(self) -> None:
+        self.local_index.stop()
+        self.remote_index.stop()
+
+    def reset(self) -> None:
+        restart_local_index = self.local_index.started
+        restart_remote_index = self.remote_index.started
+        barrier_ttl_ms = max(self.reset_barrier_timeout_ms * 2, 1000)
+        self.local_index.stop()
+        self.remote_index.stop()
+        reset_epoch = self.local_ch.begin_reset_barrier(barrier_ttl_ms)
+
+        self.local_index.reset()
+        self.remote_index.reset()
+        if not self.local_ch.mark_reset_barrier_arrival(
+            reset_epoch, barrier_ttl_ms
+        ):
+            raise RuntimeError(
+                f"Failed to mark reset barrier arrival for device type: {self.device_type}"
+            )
+        self._wait_for_global_block_cleanup(reset_epoch)
+        if not self.local_ch.finish_reset_barrier(reset_epoch):
+            raise RuntimeError(
+                f"Failed to finish reset barrier for device type: {self.device_type}"
+            )
+        self.mempool.reset()
+
+        if restart_remote_index and not self.remote_index.start(self.remote_ch):
+            raise RuntimeError(
+                f"Failed to restart distributed radix tree for device type: {self.device_type}"
+            )
+        if restart_local_index and not self.local_index.start(self.local_ch):
+            if restart_remote_index:
+                self.remote_index.stop()
+            raise RuntimeError(
+                f"Failed to restart local radix tree for device type: {self.device_type}"
+            )
+
+    def _wait_for_global_block_cleanup(self, reset_epoch: int) -> None:
+        deadline = time.monotonic() + self.reset_barrier_timeout_ms / 1000.0
+        while True:
+            barrier_ready = self.local_ch.is_reset_barrier_ready(reset_epoch)
+            has_block_keys = self.local_ch.has_any_block_keys()
+            if barrier_ready and not has_block_keys:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Timed out waiting for all nodes to enter reset and remove Redis block metadata "
+                    f"for device type: {self.device_type}; physical blocks were not reset"
+                )
+            time.sleep(self.reset_barrier_poll_ms / 1000.0)
+
+    def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+        """Match this storage tier against local and distributed indexes.
+
+        Delegate to match_all(), which selects the longer prefix rather than
+        combining local and peer matches.
+        """
+        return self.match_all(sequence_meta)
+
+    def match_all(self, sequence_meta: SequenceMeta, gpu_matched_blocks: int = 0) -> MatchResultAccel:
+        """Match this tier's local index and distributed snapshot for GET.
+
+        Select the longer prefix, preferring the local result on a tie. Fall
+        back to the local result when the distributed match lacks usable peer
+        or remote-file identifiers. The two matches are not concatenated.
+
+        This selects a source within one tier, not across CPU/SSD/REMOTE tiers.
+        gpu_matched_blocks contributes to reuse statistics.
+        """
+        sequence_meta.gen_hashes()
+        block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
+        num_blocks = sequence_meta.num_blocks
+
+        # Query both local and remote
+        t0 = time.perf_counter()
+        mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
+        t1 = time.perf_counter()
+        mr_remote = self.remote_index.match_prefix(block_hashes_t, int(num_blocks), True)
+        t2 = time.perf_counter()
+        print(f"[match_prefix timing] local: {(t1-t0)*1000:.3f}ms, remote: {(t2-t1)*1000:.3f}ms")
+        # For simplicy, we choose the one with the larger matched length.
+        # We should allow to combine the two results in the future.
+        local_key = int(mr_local.num_matched_blocks)
+        remote_key = int(mr_remote.num_matched_blocks)
+        matched_pos = "local" if local_key >= remote_key else "remote"
+        chosen = mr_local if local_key >= remote_key else mr_remote
+
+        # update cumulative statistics
+        queried_tokens = num_blocks * self.tokens_per_block
+        gpu_matched_tokens = gpu_matched_blocks * self.tokens_per_block
+        local_matched_tokens = int(mr_local.num_matched_blocks) * self.tokens_per_block
+        distributed_matched_tokens = int(chosen.num_matched_blocks) * self.tokens_per_block
+
+        self._stats_total_queried_tokens += queried_tokens
+        self._stats_gpu_matched_tokens += gpu_matched_tokens
+        self._stats_local_matched_tokens += local_matched_tokens
+        self._stats_distributed_matched_tokens += distributed_matched_tokens
+        self._stats_match_count += 1
+
+        # calculate hit ratio for each level
+        total = self._stats_total_queried_tokens
+        gpu_pct = (self._stats_gpu_matched_tokens * 100 / total) if total > 0 else 0
+        local_pct = (self._stats_local_matched_tokens * 100 / total) if total > 0 else 0
+        distributed_pct = (self._stats_distributed_matched_tokens * 100 / total) if total > 0 else 0
+
+        # calculate extra benefits for each level
+        extra_from_local = self._stats_local_matched_tokens - self._stats_gpu_matched_tokens
+        extra_from_distributed = self._stats_distributed_matched_tokens - self._stats_local_matched_tokens
+        extra_local_pct = (extra_from_local * 100 / total) if total > 0 else 0
+        extra_distributed_pct = (extra_from_distributed * 100 / total) if total > 0 else 0
+
+        print(
+            f"[STATS][REUSE] cnt={self._stats_match_count}, queried={total}, "
+            f"gpu={self._stats_gpu_matched_tokens} ({gpu_pct:.2f}%), "
+            f"flexkv_local={self._stats_local_matched_tokens} ({local_pct:.2f}%, +{extra_local_pct:.2f}%), "
+            f"flexkv_global={self._stats_distributed_matched_tokens} ({distributed_pct:.2f}%, "
+            f"+{extra_distributed_pct:.2f}%)"
+        )
+
+        # physical blocks
+        bnids_np = None
+        if chosen is mr_remote:
+            #try to use DistributedRadixTree's block_node_ids
+            #if check fails, use LocalRadixTree's match result
+            nids = chosen.block_node_ids
+            nps = chosen.physical_blocks
+            # Convert tensors to numpy views (CPU) if present
+            if isinstance(nids, torch.Tensor) and nids.numel() > 0:
+                # For P2P mode (CPU/SSD), no PCFS conversion is needed
+                # Only convert to PCFS file_nodeids if device_type is REMOTE
+                if self.device_type == DeviceType.REMOTE:
+                    bnids_np = self.nodeids_to_file_nodeids(nids.cpu().numpy(), nps.cpu().numpy())
+                    if bnids_np is None:
+                        chosen = mr_local
+                        matched_pos = "local"  # Update matched_pos after fallback
+                else:
+                    # For P2P mode, use node_ids directly
+                    bnids_np = nids.cpu().numpy().astype(np.uint32)
+                    #print(f"[REMOTE_MATCH {self.device_type.name}] Using remote data: block_ids={nps.cpu().numpy()[:min(4, len(nps))]}, node_ids={bnids_np[:min(4, len(bnids_np))]}")
+            else:
+                bnids_np = None
+                if mr_remote.num_matched_blocks > 0:
+                    #print(f"[REMOTE_MATCH {self.device_type.name}] Warning: remote matched but block_node_ids is empty, falling back to local")
+                    chosen = mr_local
+                    matched_pos = "local"  # Update matched_pos after fallback
+        phys_np = chosen.physical_blocks.cpu().numpy()
+        #maybe we should always not insert
+        if self.device_type == DeviceType.CPU and matched_pos == "remote" and mr_local.num_matched_blocks > 0:
+            insert_to_local_cpu_index = False
+        else:
+            insert_to_local_cpu_index = True
+        #TODO A big question is how to get the node id for peer_cpu and peer_ssd?
+        return MatchResultAccel(
+            num_matched_blocks=int(chosen.num_matched_blocks),
+            last_node=chosen.last_node,
+            last_node_matched_length=int(chosen.last_node_matched_length),
+            physical_blocks=phys_np,
+            block_node_ids=bnids_np,
+            matched_pos=matched_pos,
+            matched_node_ids=bnids_np,  # Set matched_node_ids for P2P transfer
+            insert_to_local_cpu_index=insert_to_local_cpu_index,
+        )
+
+    def nodeids_to_file_nodeids(self,
+                                 bnids_np: np.ndarray,
+                                 phys: np.ndarray) -> Optional[np.ndarray]:
+        """Convert per-block node ids to per-block PCFS file_nodeids.
+
+        Args:
+            bnids_np: block_node_ids from MatchResultAccel.block_node_ids
+            phys: physical_blocks from MatchResultAccel.physical_blocks
+
+        Returns:
+            file_nodeids array with dtype=uint32, or None if conversion fails
+        """
+        if bnids_np is None or phys is None:
+            return None
+        try:
+            bnids_np = np.asarray(bnids_np, dtype=np.uint32)
+            phys_np = np.asarray(phys, dtype=np.int64)
+        except Exception:
+            return None
+        if bnids_np.shape[0] != phys_np.shape[0]:
+            return None
+        out = np.full(phys_np.shape, fill_value=0, dtype=np.uint32)
+        rr = max(1, int(self.round_robin))
+
+        for i in range(bnids_np.shape[0]):
+            nid = int(bnids_np[i])
+            #check if node is active
+            is_active = self._meta.is_node_active(nid)
+            if not is_active:
+                print(f"[DEBUG] Node {nid} is not active, returning None")
+                return None
+            file_list = self.nid_to_file_nodeids.get(nid)
+            #check if file list is empty
+            if not file_list:
+                return None
+            remote_file_num = len(file_list)
+            if remote_file_num <= 0:
+                return None
+            block_id = int(phys_np[i])
+            f_idx = (block_id // rr) % remote_file_num
+            out[i] = np.uint32(file_list[f_idx])
+        return out
+
+    def match_local(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+        """Match only this node's authoritative index for this storage tier.
+
+        Do not consult the distributed snapshot or return peer block IDs.
+        Use this result for local PUT source buffers and insertion anchors.
+        """
+        sequence_meta.gen_hashes()
+        block_hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
+        num_blocks = sequence_meta.num_blocks
+
+        mr_local = self.local_index.match_prefix(block_hashes_t, int(num_blocks), True)
+
+        phys_np = mr_local.physical_blocks.cpu().numpy()
+
+        return MatchResultAccel(
+            num_matched_blocks=int(mr_local.num_matched_blocks),
+            last_node=mr_local.last_node,
+            last_node_matched_length=int(mr_local.last_node_matched_length),
+            physical_blocks=phys_np,
+            block_node_ids=None,
+            matched_pos="local",
+        )
+
+    def insert(self,
+               sequence_meta: SequenceMeta,
+               physical_block_ids: torch.Tensor,
+               num_insert_blocks: int = -1,
+               match_result: Optional[MatchResultAccel] = None,
+               swa_store: bool = False) -> Optional[CRadixNode]:
+        sequence_meta.gen_hashes()
+        phys_t = torch.from_numpy(physical_block_ids).to(torch.int64) if isinstance(physical_block_ids, np.ndarray) else physical_block_ids.to(torch.int64)
+        hashes_t = torch.from_numpy(sequence_meta.block_hashes).to(torch.int64)
+
+        if match_result is None:
+            node = self.local_index.insert(
+                phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks)
+            )
+        else:
+            node = self.local_index.insert(
+                phys_t, hashes_t, int(sequence_meta.num_blocks), int(num_insert_blocks),
+                match_result.last_node, int(match_result.num_matched_blocks), int(match_result.last_node_matched_length)
+            )
+        # NOTE: Do NOT lock the node here, because the caller (put() method) will lock it
+        # The node will be unlocked in _transfer_callback after data transfer completes
+        return node
+
+    def lock_node(self, node: CRadixNode) -> None:
+        if node is None:
+            return
+        try:
+            is_remote_node = bool(node.has_block_node_ids())
+        except Exception:
+            is_remote_node = False
+        if is_remote_node:
+            self.remote_index.lock(node) #TODO why do we need to lock the remote node?
+        else:
+            self.local_index.lock(node)
+
+    def unlock(self, node: CRadixNode) -> None:
+        """Unlock a node in the appropriate index (local or remote).
+
+        Args:
+            node: The radix node to unlock
+        """
+        if node is None:
+            return
+        try:
+            is_remote_node = bool(node.has_block_node_ids())
+        except Exception:
+            is_remote_node = False
+        if is_remote_node:
+            self.remote_index.unlock(node)
+        else:
+            self.local_index.unlock(node)
+
+    def take(self,
+             num_required_blocks: int,
+             protected_node: Optional[CRadixNode] = None,
+             strict: bool = True) -> torch.Tensor:
+        # Calculate current utilization
+        utilization = (self.mempool.num_total_blocks - self.mempool.num_free_blocks) / self.mempool.num_total_blocks if self.mempool.num_total_blocks > 0 else 0
+
+        # Proactive eviction: trigger when utilization exceeds threshold OR when blocks are needed
+        should_evict = (utilization >= self.evict_start_threshold) or (num_required_blocks > self.mempool.num_free_blocks)
+
+        if should_evict:
+            if protected_node is not None:
+                self.local_index.lock(protected_node)
+
+            # Calculate how many blocks to evict
+            # Goal: maintain free blocks above (1 - evict_start_threshold) ratio
+            target_free_blocks = int(self.mempool.num_total_blocks * (1.0 - self.evict_start_threshold))
+            evict_to_reach_target = max(0, target_free_blocks - self.mempool.num_free_blocks)
+
+            evict_block_num = max(
+                num_required_blocks - self.mempool.num_free_blocks,  # At least meet current demand
+                evict_to_reach_target,                               # Or reach target free ratio
+                int(self.mempool.num_total_blocks * self.evict_ratio) if self.evict_ratio > 0 else 0  # Or minimum evict_ratio
+            )
+
+            if evict_block_num > 0:
+                free_before = self.mempool.num_free_blocks
+                start_ns = time.perf_counter_ns()
+                target_blocks = torch.zeros(evict_block_num, dtype=torch.int64)
+                # evict() resizes target_blocks in-place to the actual freed count
+                # (may EXCEED evict_block_num when the I2 tombstone cascade frees
+                # ancestors) and returns it — trust the returned count.
+                num_evicted = self.local_index.evict(target_blocks, evict_block_num)
+                if target_blocks.numel() != num_evicted:
+                    target_blocks.resize_(num_evicted)
+                evicted_np = target_blocks.numpy()
+                self.mempool.recycle_blocks(evicted_np)
+                free_after = self.mempool.num_free_blocks
+                eviction_log_aggregator.record(
+                    tier=self.device_type.name.lower(),
+                    scope="full",
+                    reason=(
+                        "capacity"
+                        if num_required_blocks > free_before
+                        else "threshold"
+                    ),
+                    requested_blocks=num_required_blocks,
+                    required_blocks=evict_block_num,
+                    evicted_blocks=num_evicted,
+                    free_blocks_before=free_before,
+                    free_blocks_after=free_after,
+                    total_blocks=self.mempool.num_total_blocks,
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1e6,
+                    target_met=free_after
+                    >= max(num_required_blocks, target_free_blocks),
+                )
+
+            if protected_node is not None:
+                self.local_index.unlock(protected_node)
+
+        if strict and num_required_blocks > self.mempool.num_free_blocks:
+            raise ValueError(
+                f"Not enough free blocks to take, required: {num_required_blocks}, available: {self.mempool.num_free_blocks}"
+            )
+        num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
+        #print(f"[TAKE STATISTICS] device type: {self.device_type.name}, utilization: {utilization}, ",
+        #      f"should_evict: {should_evict}, num_required_blocks: {num_required_blocks}, ",
+        #      f"num_allocated_blocks: {num_allocated_blocks}, num_free_blocks: {self.mempool.num_free_blocks}")
+        return self.mempool.allocate_blocks(num_allocated_blocks)
+
+    def recycle(self, physical_blocks: np.ndarray) -> None:
+        self.mempool.recycle_blocks(physical_blocks)
+        self._drain_unmounted_swa_slots()
+
+    #TODO pfcs may not work now
+    @classmethod
+    def pcfs_ce_from_cache_config(cls, cache_config: "CacheConfig", node_id: int, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
+        """Create a PCFSCacheEngine from CacheConfig.
+
+        This replaces RemotePCFSCacheEngine. It wires both local and remote
+        radix trees using parameters from CacheConfig and the provided node_id.
+        """
+        num_blocks = int(cache_config.num_remote_blocks or 0)
+
+        # 1) Generate unique remote_file_prefix using uuid and build remote_cache_path
+        if cache_config.remote_file_prefix is None:
+            raise ValueError("remote_file_prefix must be provided in CacheConfig when enable_remote is True")
+        if cache_config.remote_file_num is None or cache_config.remote_file_num <= 0:
+            raise ValueError("remote_file_num must be a positive integer in CacheConfig when enable_remote is True")
+
+        # Prefer uuid from RedisMeta to ensure cluster-wide uniqueness, fallback to Python uuid if meta is None
+        try:
+            unique_suffix = meta.get_uuid() if meta is not None else __import__("uuid").uuid4().hex
+        except Exception:
+            unique_suffix = __import__("uuid").uuid4().hex
+
+        new_prefix = f"{cache_config.remote_file_prefix}_{unique_suffix}"
+        cache_config.remote_file_prefix = new_prefix
+        cache_config.remote_cache_path = [
+            f"{cache_config.remote_file_prefix}_{i}" for i in range(cache_config.remote_file_num)
+        ]
+
+        # 2) Create PCFS instance and lookup/create files to collect nodeids
+        remote_cfg = cache_config.remote_config_custom or {}
+        pcfs_fsid = remote_cfg.get("pcfs_fsid")
+        pcfs_port = remote_cfg.get("pcfs_port")
+        pcfs_ip = remote_cfg.get("pcfs_ip")
+        pcfs_parent_nodeid = remote_cfg.get("pcfs_parent_nodeid")
+        if None in (pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid):
+            raise ValueError("Some required PCFS config fields are missing: pcfs_fsid, pcfs_port, pcfs_ip, pcfs_parent_nodeid")
+
+        pcfs = c_ext.Pcfs(pcfs_fsid, pcfs_port, pcfs_ip, False, pcfs_parent_nodeid)
+        if not pcfs.init():
+            raise ValueError(f"PCFS init failed: fsid={pcfs_fsid}, ip={pcfs_ip}")
+
+        node_ids: List[int] = []
+        # Derive file size if available; otherwise, use 0 when not provided (only lookup or create placeholder)
+        # Prefer explicit file_size mode
+        file_size = 0
+        if getattr(cache_config, "remote_cache_size_mode", "file_size") == "file_size":
+            file_size = int(cache_config.remote_file_size or 0)
+
+        for remote_path in cache_config.remote_cache_path:
+            nodeid = pcfs.lookup_or_create_file(remote_path, file_size, True)
+            if nodeid == 0:
+                raise ValueError(f"lookup or create file failed for file: {remote_path}")
+            node_ids.append(int(nodeid))
+
+        # 3) Register nodeids into Redis for discovery
+        if meta is not None:
+            meta.add_node_ids(node_ids)
+
+        # Set global pcfs instance for subsequent C++ remote transfers
+        try:
+            c_ext.set_pcfs_instance(pcfs)
+        except Exception:
+            pass
+
+        return cls(
+            num_total_blocks=num_blocks,
+            tokens_per_block=int(cache_config.tokens_per_block),
+            evict_ratio=float(cache_config.evict_ratio),
+            device_type=DeviceType.REMOTE,
+            local_lease_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms),
+            local_renew_lease_ms=int(GLOBAL_CONFIG_FROM_ENV.renew_lease_ms),
+            local_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+            local_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
+            remote_max_num_blocks=num_blocks,
+            redis_node_id=int(node_id),
+            remote_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+            remote_rebuild_interval_ms=int(GLOBAL_CONFIG_FROM_ENV.rebuild_interval_ms),
+            remote_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
+            local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
+            eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
+            reset_barrier_timeout_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_timeout_ms),
+            reset_barrier_poll_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_poll_ms),
+            meta=meta,
+        )
+
+    #TODO is this enough for peercpu and peerssd?
+    @classmethod
+    def from_cache_config(cls, cache_config: "CacheConfig", node_id: int, device_type: DeviceType, meta: Optional[RedisMeta] = None) -> "HierarchyLRCacheEngine":
+
+        if device_type == DeviceType.REMOTE:
+            return cls.pcfs_ce_from_cache_config(cache_config, node_id, meta)
+        else:
+            # select correct blocks configuration based on device_type
+            if device_type == DeviceType.CPU:
+                local_max_num_blocks = int(cache_config.num_cpu_blocks)
+            elif device_type == DeviceType.SSD:
+                local_max_num_blocks = int(cache_config.num_ssd_blocks)
+            else:
+                raise ValueError(f"Invalid device type: {device_type}")
+                #local_max_num_blocks = int(cache_config.num_local_blocks or 0)
+
+            return cls(
+                num_total_blocks=int(local_max_num_blocks or 0),
+                tokens_per_block=int(cache_config.tokens_per_block),
+                evict_ratio=float(GLOBAL_CONFIG_FROM_ENV.evict_ratio),
+                device_type=device_type,
+                local_max_num_blocks=local_max_num_blocks,
+                local_lease_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.lease_ttl_ms),
+                local_renew_lease_ms=int(GLOBAL_CONFIG_FROM_ENV.renew_lease_ms),
+                local_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+                local_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
+                # local_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
+                remote_max_num_blocks=int(cache_config.num_remote_blocks or 0),
+                redis_node_id=int(node_id),
+                # remote_node_id=int(node_id),
+                # remote_lt_pool_initial_capacity=int(getattr(cache_config, "lt_pool_initial_capacity", 0)),
+                remote_refresh_batch_size=int(GLOBAL_CONFIG_FROM_ENV.refresh_batch_size),
+                remote_rebuild_interval_ms=int(GLOBAL_CONFIG_FROM_ENV.rebuild_interval_ms),
+                remote_idle_sleep_ms=int(GLOBAL_CONFIG_FROM_ENV.idle_sleep_ms),
+                local_safety_ttl_ms=int(GLOBAL_CONFIG_FROM_ENV.safety_ttl_ms),
+                evict_start_threshold=float(GLOBAL_CONFIG_FROM_ENV.evict_start_threshold),
+                hit_reward_seconds=int(GLOBAL_CONFIG_FROM_ENV.hit_reward_seconds),
+                eviction_policy=GLOBAL_CONFIG_FROM_ENV.eviction_policy,
+                reset_barrier_timeout_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_timeout_ms),
+                reset_barrier_poll_ms=int(GLOBAL_CONFIG_FROM_ENV.reset_barrier_poll_ms),
+                meta=meta,
+            )
+            raise ValueError("Invalid device type: {cache_config.device_type}")

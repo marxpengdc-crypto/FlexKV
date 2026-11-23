@@ -1,0 +1,104 @@
+# Build a release wheel for pull requests and protected-branch pushes.
+# Wheels from protected-branch pushes are also uploaded to COS.
+name: flexkv ci
+
+on:
+  pull_request:
+    branches: [ "main", "dev"]
+  push:
+    branches: [ "main", "dev"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Wheel
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+          os: ['ubuntu-22.04']
+          python-version: ['3.10']
+          pytorch-version: ['2.6.0']
+          cuda-version: ['12.4']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Linux Env
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          bash -x .github/workflows/scripts/env.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+            python-version: ${{ matrix.python-version }}
+            cache: 'pip'
+
+      - name: Install CUDA ${{ matrix.cuda-version }}
+        run: |
+          bash -x .github/workflows/scripts/cuda-install.sh ${{ matrix.cuda-version }} ${{ matrix.os }}
+
+      - name: Install PyTorch ${{ matrix.pytorch-version }} with CUDA ${{ matrix.cuda-version }}
+        run: |
+          bash -x .github/workflows/scripts/pytorch-install.sh ${{ matrix.python-version }} ${{ matrix.pytorch-version }} ${{ matrix.cuda-version }}
+
+      - name: Build wheel
+        shell: bash
+        env:
+          TORCH_CUDA_ARCH_LIST: "8.9 9.0+PTX"
+          MAX_JOBS: 4
+        run: |
+          ./build.sh --release
+
+      - name: Install wheel and test dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+
+      - name: Run CPU unit tests
+        shell: bash
+        run: |
+          mapfile -t unit_test_files < <(
+            python - <<'PY'
+          import os
+          from pathlib import Path
+
+          tests_dir = Path(os.environ["GITHUB_WORKSPACE"]) / "tests"
+          marker = "pytestmark = pytest.mark.unit"
+          for path in sorted(tests_dir.rglob("test_*.py")):
+              if marker in path.read_text():
+                  print(path)
+          PY
+          )
+
+          if [ "${#unit_test_files[@]}" -eq 0 ]; then
+            echo "No unit test files found."
+            exit 1
+          fi
+
+          echo "Running ${#unit_test_files[@]} CPU unit test files against the built wheel."
+          cd "$RUNNER_TEMP"
+          # Keep pytest's configured pythonpath from shadowing the installed wheel.
+          timeout 10m python -m pytest -q --maxfail=1 -o pythonpath= "${unit_test_files[@]}"
+
+      - name: Get Date and Time
+        if: github.event_name == 'push'
+        run: |
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+          echo "time=$(date +'%H-%M-%S')" >> $GITHUB_ENV
+
+      - name: Upload to cos
+        if: github.event_name == 'push'
+        uses: shallwefootball/s3-upload-action@master
+        with:
+          aws_key_id: ${{ secrets.COS_SECRET_ID }}
+          aws_secret_access_key: ${{ secrets.COS_SECRET_KEY }}
+          aws_bucket: ${{ secrets.COS_BUCKET }}
+          endpoint: ${{ secrets.COS_ENDPOINT }}
+          source_dir: dist
+          destination_dir: flexkv/${{ env.date }}/${{ env.time }}

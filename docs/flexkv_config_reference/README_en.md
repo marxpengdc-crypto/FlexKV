@@ -1,0 +1,262 @@
+# FlexKV Configuration Guide
+
+This guide provides detailed instructions on how to configure and use FlexKV's online service configuration file (`flexkv_config.json`), covering the meaning of all parameters, recommended values, and typical usage scenarios.
+
+---
+
+## Basic Configuration Options
+
+### 1. Configuration via Config File
+
+If the `FLEXKV_CONFIG_PATH` environment variable is set, the configuration file specified by this variable will be used with priority. Both yml and json file formats are supported.
+
+Below is a recommended configuration example that enables both CPU and SSD cache layers:
+
+YML configuration:
+```yml
+cpu_cache_gb: 32
+ssd_cache_gb: 1024
+ssd_cache_dir: /data/flexkv_ssd/
+enable_gds: false
+```
+Or using JSON configuration:
+```json
+{
+  "cpu_cache_gb": 32,
+  "ssd_cache_gb": 1024,
+  "ssd_cache_dir": "/data/flexkv_ssd/",
+  "enable_gds": false
+}
+```
+- `cpu_cache_gb`: CPU cache layer capacity in GB, must not exceed physical memory.
+- `ssd_cache_gb`: SSD cache layer capacity in GB. Recommended to be greater than `cpu_cache_gb` and a multiple of `FLEXKV_MAX_FILE_SIZE_GB`. Set to 0 if only using CPU cache (SSD cache will not be enabled).
+- `ssd_cache_dir`: Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `ssd_cache_dir: /data0/flexkv_ssd/;/data1/flexkv_ssd/` to improve bandwidth.
+- `enable_gds`: Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default.
+- `swa_multi_group`: DeepSeek-V4 SWA sidecar switch. When omitted or set to `true`, SWA KV is stored and restored together with the attention/indexer compress states. Set it explicitly to `false` to keep SWA KV I/O while skipping state registration and I/O.
+
+To switch to SWA-only mode, add the following explicit setting:
+
+```yml
+swa_multi_group: false
+```
+
+---
+
+### 2. Configuration via Environment Variables
+
+When `FLEXKV_CONFIG_PATH` is unset, the integration loads the UserConfig fields below from environment variables.
+
+> When a configuration file is used, UserConfig fields are loaded from that file and their environment counterparts are not merged. Some runtime settings, such as `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES` and `FLEXKV_CUDAHOST_CHUNK_SIZE_GB`, are read directly from the environment and remain effective; see the individual entries.
+
+| Environment Variable | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `FLEXKV_CPU_CACHE_GB` | int | 16 | CPU cache layer capacity in GB, must not exceed physical memory |
+| `FLEXKV_SSD_CACHE_GB` | int | 0 | SSD cache layer capacity in GB. Recommended to be greater than `FLEXKV_CPU_CACHE_GB` and a multiple of `FLEXKV_MAX_FILE_SIZE_GB`. Set to 0 if only using CPU cache (SSD cache will not be enabled) |
+| `FLEXKV_SSD_CACHE_DIR` | str | "./flexkv_ssd" | Directory where SSD cache data is stored. If multiple SSDs are available, separate multiple mount paths with semicolons `;`. For example, `"/data0/flexkv_ssd/;/data1/flexkv_ssd/"` to improve bandwidth |
+| `FLEXKV_ENABLE_GDS` | bool | 0 | Whether to enable GPU Direct Storage (GDS). If hardware and drivers support it, enabling this can improve SSD to GPU data throughput. Disabled by default, set to 1 to enable |
+| `FLEXKV_USE_HUGEPAGE_CPU_BUFFER` | bool | 0 | Enable HugePages for the general CPU KV cache. Disabled by default; set to 1 to enable |
+| `FLEXKV_USE_HUGEPAGE_TMP_BUFFER` | bool | 0 | Enable HugePages for the temporary CPU staging buffer used with `enable_p2p_ssd`. Disabled by default; set to 1 to enable |
+| `FLEXKV_HUGEPAGE_SIZE_BYTES` | int | 2097152 | HugePage size in bytes. Defaults to 2 MiB; use `1073741824` when the host provides 1 GiB HugePages |
+| `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES` | int | HugePage size | Pad a shareable HugePage backing mapping to this boundary while preserving the tensor's logical length. With Mooncake versions that divide an external buffer into equal subregions, use `33554432` (32 MiB) to keep those regions HugePage-aligned |
+| `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` | int | 549755813888 | Maximum size of one Mooncake external MR. It can also be set as `mooncake_max_mr_size_bytes` in YAML/JSON; use `2147483648` for a 2 GiB transport limit |
+| `FLEXKV_MOONCAKE_MR_SPLIT_POLICY` | str | `strict` | Mooncake external-MR split policy: `strict` preserves KV-block, pointer, and size alignment; `block_boundary` keeps every KV block inside one MR while allowing derived MR pointers/sizes to be unaligned. Set `mooncake_mr_split_policy: block_boundary` in YAML/JSON for a small MR limit such as 2 GiB |
+| `FLEXKV_CUDAHOST_CHUNK_SIZE_GB` | float | 0 | Chunk size in GB used when calling `cudaHostRegister` on a HugePage host buffer. Default `0` registers the whole buffer in a single call; a value greater than 0 registers (and correspondingly unregisters) the buffer in chunks of this size, which avoids one-shot registration failures on very large buffers. The chunk size is rounded down to a 4 KiB page boundary with a small alignment margin reserved |
+| `FLEXKV_SWA_MULTI_GROUP` | bool | unset (auto-enabled) | For DeepSeek-V4, unset or `1` stores/restores SWA KV with attention/indexer compress states; `0` keeps SWA KV I/O only |
+
+---
+
+## Advanced Configuration Options
+Advanced configuration is mainly for users who need fine-tuned performance optimization or custom special requirements. It is recommended for users with some understanding of FlexKV.
+Supported global configuration fields can be overridden by a YAML/JSON file; when both sources set the same supported field, the file takes priority over the environment-derived value. Some settings are read directly from the environment and do not support file overrides. Defaults apply when no value is supplied.
+If setting in a configuration file, remove the `FLEXKV_` prefix and convert everything to lowercase. For example, setting `server_client_mode: 1` in a yml file will override the value of the `FLEXKV_SERVER_CLIENT_MODE` environment variable.
+Some configurations can only be set through environment variables.
+
+### Enable/Disable FLEXKV
+
+> Note: This configuration can only be set through environment variables
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `ENABLE_FLEXKV` | bool | 1 | 0-Disable FLEXKV, 1-Enable FLEXKV |
+
+
+
+---
+
+### Multi-Instance Mode Configuration
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_SERVER_CLIENT_MODE` | bool | 0 | `server_client_mode`: Whether to force enable server-client mode |
+| `FLEXKV_SERVER_LAUNCH_MODE` | str | "embedded" | Shared-server ownership: `embedded` lets client 0 launch it; `external` makes every instance client-only |
+| `FLEXKV_SERVER_RECV_PORT` | str | "ipc:///tmp/flexkv_server" | `server_recv_port`: Server receive port configuration. Different instances in multi-instance mode should use the same port |
+| `FLEXKV_INSTANCE_NUM` | int | 1 | Number of inference engine instances |
+| `FLEXKV_INSTANCE_ID` | int | 0 | Inference engine instance ID |
+
+---
+
+### KV Cache Layout Types
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_CPU_LAYOUT` | str | BLOCKFIRST | CPU storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_SSD_LAYOUT` | str | BLOCKFIRST | SSD storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_REMOTE_LAYOUT` | str | BLOCKFIRST | REMOTE storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+| `FLEXKV_GDS_LAYOUT` | str | BLOCKFIRST | GDS storage layout, options: `LAYERFIRST` and `BLOCKFIRST`, recommended to use `BLOCKFIRST` |
+
+---
+
+### CPU-GPU Transfer Optimization
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_USE_CE_TRANSFER_H2D` | bool | 0 | Whether to use cudaMemcpyAsync for Host→Device transfers. Can avoid occupying SM, but transfer speed will be reduced |
+| `FLEXKV_USE_CE_TRANSFER_D2H` | bool | 0 | Whether to use cudaMemcpyAsync for Device→Host transfers. Can avoid occupying SM, but transfer speed will be reduced |
+| `FLEXKV_TRANSFER_NUM_CTA_H2D` | int | 4 | Number of CUDA thread blocks (CTAs) used for H2D transfer, only effective when `FLEXKV_USE_CE_TRANSFER_H2D` is 0 |
+| `FLEXKV_TRANSFER_NUM_CTA_D2H` | int | 4 | Number of CUDA thread blocks (CTAs) used for D2H transfer, only effective when `FLEXKV_USE_CE_TRANSFER_D2H` is 0 |
+| `FLEXKV_CE_PATH_OPT` | bool | 1 | Enable the CE optimized five-path adaptive strategy. `0` = baseline (`PER_BLOCK` per-block memcpy, no optimization); `1` = optimized paths (`CONTIG_DIRECT` / `SEGMENT_DIRECT` / `SEGMENT_SCATTER` / `GATHER_SCATTER` / `GATHER_DIRECT` auto-select, **default**). Only effective when `FLEXKV_USE_CE_TRANSFER_H2D` or `FLEXKV_USE_CE_TRANSFER_D2H` is 1 |
+| `FLEXKV_CE_SEGMENT_THRESHOLD` | int | 8 | Segment count threshold for `SEGMENT_DIRECT` vs `GATHER_SCATTER` selection (only when `FLEXKV_CE_PATH_OPT=1`). **Applies to LAYERFIRST scenarios** (non-contiguous segments ≤ threshold → `SEGMENT_DIRECT`, otherwise → `GATHER_SCATTER`). BLOCKFIRST scenarios use `GATHER_DIRECT`, whose internal copy switches between a contiguous full-block copy and a per-block copy by batch granularity; the per-block variant can take the `cudaMemcpy2DAsync` fast path gated by `FLEXKV_ENABLE_CE_MEMCPY2D`. The threshold also selects the `cudaMemcpy2DAsync` branch in `SEGMENT_SCATTER` / `GATHER_SCATTER` |
+| `FLEXKV_KV_SHARED_ACROSS_RANKS_MODE` | str | "sharded" | **Only applicable to MLA scenarios** (kv_heads=1, all TP ranks have identical KV). Controls how CPU KV Cache is written during D2H transfer. Available options:<br/>• `rank_rotate` - Rotates the designated rank that writes the complete KV per request, avoiding sustained single-rank overload that causes thermal throttling; best with CE<br/>• `sharded` - **Default**. Each GPU writes 1/N shard to form one complete KV (requires `chunk_size % num_gpus == 0`)<br/>• `all_write` - Each GPU writes complete KV to its own location (N× CPU memory)<br/>• `rank0_only` - Only rank 0 writes complete KV<br/>• `layer_parallel` - Writes in parallel by layer |
+| `FLEXKV_ENABLE_CE_MEMCPY2D` | bool | 1 | Controls the `cudaMemcpy2DAsync` strided fast path in `SEGMENT_SCATTER` / `GATHER_SCATTER` / `GATHER_DIRECT` (effective for both D2H and H2D). `1` = **Default**: uses `cudaMemcpy2DAsync` for the strided GPU↔CPU step, which is fast on NVIDIA but slow or unsupported on other platforms; `0` = portable staging-buffer + CPU scatter/gather path for those platforms. Only effective when CE transfer is enabled and one of those three paths is selected; `CONTIG_DIRECT` / `SEGMENT_DIRECT` are unaffected |
+| `FLEXKV_CE_GATHER_THREADS` | int | 4 | Thread count for the parallel CPU gather/scatter thread pool used in `SEGMENT_SCATTER` / `GATHER_SCATTER` paths (BLOCKFIRST scattered layouts). Unset = `4` (parallel ON, 4 threads); `0` = disable parallel (single-thread memcpy baseline); `N>0` = parallel ON with N threads (including the calling thread). The thread pool is `thread_local` — each GPU dispatch thread gets its own pool with zero cross-GPU contention. LAYERFIRST layouts merge consecutive blocks into a single large copy and do not use the thread pool |
+| `FLEXKV_CE_GATHER_NT` | bool | 1 | Controls non-temporal (NT) stores (AVX-512 / AVX2 streaming store) on the write-once staging / KV-pool destination in the CPU scatter/gather paths. `1` = **Default**: use NT stores to avoid RFO traffic and cache pollution; `0` = fall back to `std::memcpy`. On non-x86 platforms, NT stores are unavailable and `memcpy` is always used regardless of this setting |
+| `FLEXKV_LAYERWISE_NOTIFY_MODE` | str | "hostfunc" | Notification mechanism used by layerwise H2D transfer to signal the inference engine after each layer batch completes:<br/>• `hostfunc` - Default. Uses `cudaLaunchHostFunc` to enqueue a host callback on the CUDA stream; fires precisely when the GPU finishes the batch<br/>• `polling` - A background thread polls per-batch CUDA events via `cudaEventQuery` and writes the eventfd as soon as all GPUs complete each batch. Avoids the cross-thread scheduling overhead of `cudaLaunchHostFunc`; benchmarked faster than `hostfunc` on NVIDIA 8x GPU (e.g. cuda engine: small 0.60→0.40ms 1.50x, medium 4.39→1.87ms 2.35x, large 16.79→16.62ms 1.01x). Costs one busy-polling CPU thread per `LayerwiseTransferGroup` instance |
+
+---
+
+### CUDA MPS (Multi-Process Service)
+
+FlexKV does not start or stop CUDA MPS (`FLEXKV_ENABLE_MPS` has been removed); start the MPS daemon manually **before launching the inference engine**. A process that initializes CUDA before the daemon is running does not join MPS.
+
+FlexKV's transfer workers are separate processes, and the default H2D/D2H copies are SM kernels. Without MPS the GPU time-slices them against the inference engine's kernels, so transfers, layerwise H2D included, do not overlap with computation.
+
+```bash
+nvidia-cuda-mps-control -d            # start the MPS daemon
+# launch the inference engine
+echo quit | nvidia-cuda-mps-control   # stop the daemon after the engine exits
+```
+
+---
+
+### CPU KV Pool NUMA Spreading
+
+> Note: This configuration can only be set through environment variables
+
+FlexKV's KVServer is launched by the `dp_client_id == 0` caller (e.g. the SGLang scheduler of GPU0), and the CPU KV pool shared by all GPUs is allocated in the TransferManager process it spawns. Linux mempolicy and CPU affinity are inherited across fork/exec, so when the inference engine binds each rank to its GPU's NUMA node (e.g. SGLang's default `SGLANG_AUTO_NUMA_BIND=1`, i.e. `numactl --cpunodebind=N --membind=N`), the whole CPU KV pool lands on GPU0's node, and Mooncake RDMA traffic only uses that node's NICs.
+
+When enabled (off by default; set `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD=1`), FlexKV follows Mooncake's `allocate_buffer_numa_segments`:
+
+1. KVServer / TransferManager drop the inherited binding at startup: CPU affinity is reset to the CPUs of all participating nodes, and the task mempolicy becomes interleave across those nodes.
+2. The CPU KV pool (including the SWA pool) is split into one contiguous region per node, each set to its node with `mbind(MPOL_PREFERRED)`. Region boundaries are aligned to both the KV block and the page (and, for HugePages, to `FLEXKV_HUGEPAGE_MAPPING_ALIGNMENT_BYTES`), so no block straddles two regions.
+   - Default memory: the pool is a memfd (shmem). The per-region policy is set with `mbind` first, then TransferManager populates each region with parallel `fallocate` on that node's CPUs; the log prints `populated in Xs`. Without this, pages would be faulted lazily inside 16 workers' `cudaHostRegister` and Mooncake's `ibv_reg_mr` at the same time, which measured about 3x slower registration. This also removes the full copy the legacy path incurred when torch moved the private tensor into `/dev/shm`.
+   - HugePages (`FLEXKV_USE_HUGEPAGE_CPU_BUFFER=1`): mbind on hugetlb memory only applies to the current VMA, so TransferManager prefaults every HugePage with node-local threads first (as Mooncake does). If a node lacks free HugePages, a warning is logged and the excess spills to other nodes.
+3. The Mooncake Store backend registers one MR per region; each region still honours `FLEXKV_MOONCAKE_MAX_MR_SIZE_BYTES` / `FLEXKV_MOONCAKE_MR_SPLIT_POLICY` internally. Mooncake labels each MR `cpu:N` from the node of its first page, so RDMA reads and writes of every region use that node's local NICs.
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_ENABLE_CPU_CACHE_NUMA_SPREAD` | int | 0 | Only `0` / `1` are accepted; other values fail at startup. `1`: enable the NUMA spreading above (reset inherited binding, split the CPU pool per node, register Mooncake MRs per region). `0`: legacy behaviour, memory follows the launcher's binding |
+| `FLEXKV_NUMA_NODES` | str | unset | Node list to spread over, e.g. `0,1` or `0-3`, intersected with the process's `Mems_allowed`. When unset, all nodes in `Mems_allowed` that have CPUs are used (memory-only CXL/HBM nodes are skipped). Nothing is done when fewer than 2 nodes remain |
+
+Notes:
+
+- A warning is logged and the pool is not split in these cases: the container forbids `mbind` / `set_mempolicy` (Docker needs `--cap-add SYS_NICE`), or `lcm(block size, page/mapping alignment)` is too coarse for an even split. This fallback is **not** the same as `0`: the binding KVServer / TransferManager inherited has already been reset (CPU affinity widened to all participating nodes; interleave mempolicy when `set_mempolicy` succeeded), so the pool follows the reset policy rather than the launcher's binding. Set `0` for the exact legacy behaviour.
+- Log markers: `[NUMA][TransferManager] ... reset inherited binding`, `[NUMA] CPU pool ... spread over nodes`, and `[MooncakeStoreBackend] registering external MRs: ... regions=[(ptr, size, 'cpu:0'), (ptr, size, 'cpu:1')]`. At runtime, `numastat -p <TransferManager pid>` or `numastat -m` shows per-node Shmem/HugePages usage.
+- The CPU pool is shared by every GPU, so any GPU may read or write any block, and about half of the H2D/D2H traffic still crosses NUMA nodes. This feature balances memory capacity and RDMA NIC load across nodes.
+
+---
+
+### SSD I/O Optimization
+
+> Note: Setting `iouring_entries` to 0 disables iouring. Not recommended to set to 0.
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_MAX_FILE_SIZE_GB` | float | -1 | Maximum size of a single SSD file, -1 means unlimited |
+| `FLEXKV_IOURING_ENTRIES` | int | 512 | io_uring queue depth. Recommended to set to `512` to improve concurrent I/O performance |
+| `FLEXKV_HOST_BLOCK_ALIGN` | int | 1 | Pad each multi-layer-group CPU/SSD block to a multiple of this many bytes. Set `4096` with an SSD tier so SSD I/O can use O_DIRECT (DeepSeek V4.1 blocks are not 4 KiB multiples) |
+| `FLEXKV_IOURING_FLAGS` | int | 0 | io_uring flags, default is 0 |
+| `FLEXKV_SSD_IO_OPT` | bool | 1 | Master switch for SSD↔CPU transfer I/O optimization (on by default). When enabled, the system automatically coalesces many small scattered I/Os into fewer large ones, cutting syscall overhead and improving transfer efficiency; set to `0` to fall back to the most basic one-I/O-per-chunk transfers (correct but slower) |
+
+
+---
+
+### Multi-Node TP
+
+> Note: These configurations can only be set through environment variables
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_MASTER_HOST` | str | "localhost" | Master node IP for multi-node TP |
+| `FLEXKV_MASTER_PORTS` | str | "5556,5557,5558" | Master node ports for multi-node TP. Uses three ports, separated by commas |
+
+
+---
+
+### Logging Configuration
+
+> Note: These configurations can only be set through environment variables
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_LOGGING_PREFIX` | str | "FLEXKV" | Logging prefix |
+| `FLEXKV_LOG_LEVEL` | str | "INFO" | Log output level, options: "DEBUG" "INFO" "WARNING" "ERROR" "CRITICAL" "OFF" |
+| `FLEXKV_NUM_LOG_INTERVAL_REQUESTS` | int | 200 | Log output interval request count |
+
+
+
+---
+
+### Tracing and Debugging
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_ENABLE_TRACE` | bool | 0 | Whether to enable performance tracing. Recommended to disable (`0`) in production to reduce overhead |
+| `FLEXKV_TRACE_FILE_PATH` | str | "./flexkv_trace.log" | Trace log file path |
+| `FLEXKV_TRACE_MAX_FILE_SIZE_MB` | int | 100 | Maximum size (MB) per trace log file |
+| `FLEXKV_TRACE_MAX_FILES` | int | 5 | Maximum number of trace log files to retain |
+| `FLEXKV_TRACE_FLUSH_INTERVAL_MS` | int | 1000 | Trace log flush interval (milliseconds) |
+
+
+---
+
+### Control Plane Optimization
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_INDEX_ACCEL` | bool | 1 | 0-Enable Python version RadixTree implementation, 1-Enable C++ version RadixTree implementation |
+| `FLEXKV_EVICTION_POLICY` | str | "lru" | Cache eviction policy, options: "lru", "lfu", "slru", "fifo", "mru", and "filo". "lru" means Least Recently Used, "lfu" means Least Frequently Used, "fifo" means First In First Out, "mru" means Most Recently Used, "filo" means First In Last Out |
+| `FLEXKV_EVICT_RATIO` | float | 0 | CPU and SSD eviction ratio for proactive eviction per cycle (0.0 = no minimum batch ratio; the request and utilization threshold still determine eviction). For example, `0.05` requests a minimum batch of 5% of total blocks, subject to the selected policy and available evictable blocks |
+| `FLEXKV_EVICT_START_THRESHOLD` | float | 1.0 | Memory utilization threshold to trigger proactive eviction. When the cache utilization reaches this ratio, FlexKV starts evicting nodes proactively. For example, `0.7` means eviction begins when 70% of the cache is occupied. At `1.0`, insufficient free blocks can still trigger eviction before the cache is full |
+| `FLEXKV_HIT_REWARD_SECONDS` | int | 0 | Number of bonus seconds added to a node's effective access time on each cache hit, enhancing LRU with frequency awareness. When set to `0` (default), standard LRU behavior applies. When set to a positive value, frequently hit nodes accumulate extra protection time, making them harder to evict. See [Eviction Policy Guide](../eviction_policy/README_en.md) for details |
+
+---
+
+### Chunked prefetch
+
+Chunked prefetch is disabled by default. Its policy, limits, configuration
+examples and compatibility requirements are described in the
+[SGLang integration guide](../../flexkv/integration/sglang/README.md#chunked-remote-prefetch).
+The Mooncake Store and control-message tuning options are documented in
+[cache tier performance controls](../cache_tier_performance_controls.md).
+
+---
+
+### SGLang Integration
+
+> Note: The following configuration only takes effect when using the SGLang integration (`flexkv.integration.sglang.connector`).
+
+| Environment Variable | Type | Default | Description |
+|---------------------|------|---------|-------------|
+| `FLEXKV_ENABLE_COLLECTIVE_SYNC` | bool | 1 | Whether to enable cross-rank collective sync (scatter/barrier/all_reduce). This sync is primarily used for coordination between Pipeline Parallelism (PP) stages. Can be set to 0 to disable in non-PP deployments to reduce sync overhead and improve performance |
+
+## Worker startup deadlines
+
+- `FLEXKV_WORKER_SPAWN_TIMEOUT_S` (default `60`): bounds the TransferManager
+  subprocess start handshake.
+- `FLEXKV_READY_TIMEOUT_S` (default `360`): bounds the SGLang connector's wait
+  for FlexKV readiness after registration.
+
+Both values must be finite and positive. Initialization failures include the
+child traceback in the parent error. Health checks continue after readiness,
+including during completion waits. These settings do not shorten the existing
+transfer drain/shutdown timeout.

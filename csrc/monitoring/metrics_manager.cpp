@@ -1,0 +1,222 @@
+/**
+ * @file metrics_manager.cpp
+ * @brief Implementation of FlexKV Prometheus Monitoring Manager
+ */
+
+#include "metrics_manager.h"
+#include "logging.h"
+
+#include <thread>
+
+namespace flexkv {
+namespace monitoring {
+
+MetricsManager& MetricsManager::Instance() {
+    static MetricsManager instance;
+    return instance;
+}
+
+MetricsManager::MetricsManager() {
+    // Default disabled, must call Configure() from Python to enable
+    enabled_ = false;
+    configured_ = false;
+}
+
+MetricsManager::~MetricsManager() {
+    Shutdown();
+}
+
+void MetricsManager::Configure(bool enabled, int port) {
+    // Protect against duplicate configuration
+    if (configured_) {
+        FLEXKV_LOG_DEBUG(
+            "operation=metrics_config act=configure status=skipped "
+            "reason=already_configured");
+        return;
+    }
+    configured_ = true;
+    enabled_ = enabled;
+    port_ = port;
+    
+    if (enabled_) {
+        FLEXKV_LOG_INFO(
+            "operation=metrics_config act=configure status=success "
+            "enabled=true port=%d",
+            port_);
+    } else {
+        FLEXKV_LOG_DEBUG(
+            "operation=metrics_config act=configure status=success "
+            "enabled=false");
+    }
+}
+
+bool MetricsManager::EnsureInitialized() {
+#ifdef FLEXKV_ENABLE_MONITORING
+    // Must call Configure() from Python first to enable metrics
+    if (!configured_ || !enabled_) return false;
+    if (running_.load()) return true;
+    
+    // Use atomic flag to ensure only one thread attempts initialization
+    bool expected = false;
+    if (!init_attempted_.compare_exchange_strong(expected, true)) {
+        // Another thread is initializing or has initialized
+        // Wait for initialization to complete
+        while (!running_.load() && init_attempted_.load()) {
+            std::this_thread::yield();
+        }
+        return running_.load();
+    }
+    
+    // Always bind to localhost (127.0.0.1) for security
+    std::string bind_address = "127.0.0.1:" + std::to_string(port_);
+    Initialize(bind_address);
+    return running_.load();
+#else
+    return false;
+#endif
+}
+
+bool MetricsManager::Initialize(const std::string& bind_address) {
+#ifdef FLEXKV_ENABLE_MONITORING
+    std::lock_guard<std::mutex> lock(init_mutex_);
+    
+    if (running_.load()) {
+        return true;
+    }
+
+    if (!enabled_) {
+        FLEXKV_LOG_DEBUG(
+            "operation=metrics_init act=complete status=skipped "
+            "reason=disabled");
+        return false;
+    }
+
+    try {
+        // Create registry
+        registry_ = std::make_shared<prometheus::Registry>();
+
+        // Create HTTP exposer
+        exposer_ = std::make_unique<prometheus::Exposer>(bind_address);
+        exposer_->RegisterCollectable(registry_);
+
+        // Counter: Cache operations
+        cache_ops_family_ = &prometheus::BuildCounter()
+            .Name("flexkv_cpp_cache_ops_total")
+            .Help("Total number of cache operations by type (hit/miss/insert/evict/match)")
+            .Register(*registry_);
+
+        // Counter: Cache blocks (for tracking blocks in operations)
+        cache_blocks_family_ = &prometheus::BuildCounter()
+            .Name("flexkv_cpp_cache_blocks_total")
+            .Help("Total number of blocks involved in cache operations (matched/inserted/evicted)")
+            .Register(*registry_);
+
+        running_.store(true);
+        FLEXKV_LOG_INFO(
+            "operation=metrics_init act=complete status=success "
+            "endpoint=\"http://%s/metrics\"",
+            bind_address.c_str());
+        return true;
+
+    } catch (const std::exception& e) {
+        FLEXKV_LOG_ERROR(
+            "operation=metrics_init act=complete status=failed error=\"%s\"",
+            e.what());
+        registry_.reset();
+        exposer_.reset();
+        return false;
+    }
+#else
+    (void)bind_address;
+    return false;
+#endif
+}
+
+void MetricsManager::Shutdown() {
+#ifdef FLEXKV_ENABLE_MONITORING
+    std::lock_guard<std::mutex> lock(init_mutex_);
+    
+    if (!running_.load()) {
+        return;
+    }
+
+    running_.store(false);
+
+    // Reset components
+    exposer_.reset();
+    registry_.reset();
+
+    FLEXKV_LOG_DEBUG(
+        "operation=metrics_shutdown act=complete status=success");
+#endif
+}
+
+#ifdef FLEXKV_ENABLE_MONITORING
+// Helper to merge labels
+Labels MetricsManager::MergeLabels(const Labels& base, const Labels& extra) {
+    Labels result = base;
+    for (const auto& kv : extra) {
+        result[kv.first] = kv.second;
+    }
+    return result;
+}
+#endif
+
+// ==================== Counter: Cache Operations ====================
+
+void MetricsManager::IncrementCacheOps(CacheOperation op) {
+#ifdef FLEXKV_ENABLE_MONITORING
+    if (!EnsureInitialized() || !cache_ops_family_) return;
+    
+    auto& counter = cache_ops_family_->Add({
+        {"operation", CacheOperationToString(op)}
+    });
+    counter.Increment();
+#else
+    (void)op;
+#endif
+}
+
+// ==================== Counter: Block Operations ====================
+
+void MetricsManager::IncrementBlocksMatched(int64_t num_blocks) {
+#ifdef FLEXKV_ENABLE_MONITORING
+    if (!EnsureInitialized() || !cache_blocks_family_ || num_blocks <= 0) return;
+    
+    auto& counter = cache_blocks_family_->Add({
+        {"operation", "matched"}
+    });
+    counter.Increment(static_cast<double>(num_blocks));
+#else
+    (void)num_blocks;
+#endif
+}
+
+void MetricsManager::IncrementBlocksInserted(int64_t num_blocks) {
+#ifdef FLEXKV_ENABLE_MONITORING
+    if (!EnsureInitialized() || !cache_blocks_family_ || num_blocks <= 0) return;
+    
+    auto& counter = cache_blocks_family_->Add({
+        {"operation", "inserted"}
+    });
+    counter.Increment(static_cast<double>(num_blocks));
+#else
+    (void)num_blocks;
+#endif
+}
+
+void MetricsManager::IncrementBlocksEvicted(int64_t num_blocks) {
+#ifdef FLEXKV_ENABLE_MONITORING
+    if (!EnsureInitialized() || !cache_blocks_family_ || num_blocks <= 0) return;
+    
+    auto& counter = cache_blocks_family_->Add({
+        {"operation", "evicted"}
+    });
+    counter.Increment(static_cast<double>(num_blocks));
+#else
+    (void)num_blocks;
+#endif
+}
+
+}  // namespace monitoring
+}  // namespace flexkv
